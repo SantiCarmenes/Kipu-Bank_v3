@@ -5,9 +5,20 @@ pragma solidity 0.8.30;
 ///                                         IMPORTS
 /// -----------------------------------------------------------------------------------------------
 
-import "openzeppelin-contracts/contracts/access/Ownable.sol";
-import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+// --- OpenZeppelin ---
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20, safeApprove } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol"; // Importamos safeApprove también
+
+// --- Uniswap V4 ---
+import { IUniversalRouter } from "@uniswap/v4-periphery/contracts/interfaces/IUniversalRouter.sol";
+import { IPermit2 } from "@uniswap/v4-periphery/contracts/interfaces/IPermit2.sol";
+import { CurrencyLibrary, Currency } from "@uniswap/v4-periphery/contracts/libraries/CurrencyLibrary.sol";
+import { Commands } from "@uniswap/v4-periphery/contracts/libraries/Commands.sol";
+import { V3SwapRouter } from "@uniswap/v4-periphery/contracts/libraries/V3SwapRouter.sol";
+
+// --- Utilidades ---
+import { BytesLib } from "solidity-bytes-utils/contracts/BytesLib.sol";
 
 
 /// @title KipuBank - A simple bank with deposit and withdrawal limits
@@ -183,12 +194,22 @@ contract KipuBank is Ownable {
     /// @notice Deposit ERC20 tokens into the bank
     /// @param _tokenAddress Address of the ERC20 token
     /// @param _amount Amount of tokens to deposit
-    function depositToken(address _tokenAddress, uint256 _amount) external withinBankCap(_tokenAddress, _amount) {
-        if (_tokenAddress == ETH_ADDRESS) {
-            revert KipuBank__NotAToken();
+    /// @param _minUsdcAmountOut Minimum acceptable USDC amount from the swap, preventing slippage
+    /// @param _deadline Limit time for the swap to be executed
+    /// @dev User must approve the bank contract to spend the ERC20 token beforehand
+    /// @dev Accepts ETH if wrapped as WETH already
+    function depositToken(address _tokenAddress, uint256 _amount, uint256 _minUsdcAmountOut, uint256 _deadline) external nonZeroAmount(_amount) {
+        if (_tokenAddress == address(i_usdcToken)) {
+            revert KipuBank__UsdcAsToken();
         }
+
         IERC20(_tokenAddress).safeTransferFrom(msg.sender, address(this), _amount);
-        _deposit(_tokenAddress, msg.sender, _amount);
+        uint256 usdcAmountReceived = _swapToUsdc(_tokenAddress, _amount, _minUsdcAmountOut, _deadline, false);
+        if (s_totalUsdcDeposited + usdcAmountReceived > i_bankCapUsdc) {
+            revert KipuBank__ExceedsBankCap(s_totalUsdcDeposited, usdcAmountReceived, i_bankCapUsdc);
+        }
+
+        _handleDeposit(msg.sender, _tokenAddress, _amount, usdcAmountReceived);
     }
 
     /// @notice Withdraw ETH from the bank
@@ -208,33 +229,10 @@ contract KipuBank is Ownable {
         _withdraw(_tokenAddress, msg.sender, _amount);
     }
 
-    /// @notice Check your own token balance
-    /// @param _tokenAddress Address of the ERC20 token
-    /// @return balance Amount of tokens available for the user
-    function getMyBalance(address _tokenAddress) external view returns (uint256) {
-        return s_balances[_tokenAddress][msg.sender];
-    }
-
-    /// @notice Check the total balance of the bank
-    /// @return totalBalance Total ETH stored in the contract
-    function getTotalEthBalance() external view returns (uint256) {
-        return address(this).balance;
-    }
-
-    /// @notice Set the price feed address for a token
-    /// @param _tokenAddress Address of the token
-    function setPriceFeed(address _tokenAddress, address _priceFeedAddress) external onlyOwner {
-        uint8 decimals;
-        if (_tokenAddress == ETH_ADDRESS) {
-            decimals = 18;
-        } else {
-            decimals = IERC20Metadata(_tokenAddress).decimals();
-        }
-
-        TokenInfo memory token = TokenInfo({priceFeed: _priceFeedAddress, decimals: decimals});
-        s_tokenInfo[_tokenAddress] = token;
-        
-        emit PriceFeedUpdated(_tokenAddress, _priceFeedAddress);
+    /// @notice Check your own balance
+    /// @return balance Amount available for the user
+    function getMyBalance() external view returns (uint256) {
+        return s_balances[msg.sender];
     }
 
 
@@ -242,49 +240,12 @@ contract KipuBank is Ownable {
     ///                                     PUBLIC FUNCTIONS
     /// -----------------------------------------------------------------------------------------------
 
-    /// @notice Get value of a token amount in USD
-    /// @param _tokenAddress Address of the token
-    /// @param _amount Amount of tokens
-    /// @return valueInUsd Value in USD with decimals
-    function getValueInUsd(address _tokenAddress, uint256 _amount) public view returns (uint256) {
-        TokenInfo memory token = s_tokenInfo[_tokenAddress];
-        
-        if (token.priceFeed == address(0)) {
-            revert KipuBank__PriceFeedNotSet(_tokenAddress);
-        }
-        
-        AggregatorV3Interface priceFeed = AggregatorV3Interface(token.priceFeed);
-        (, int256 price, , uint256 updatedAt, ) = priceFeed.latestRoundData();
-
-        if (price <= 0) {
-            revert KipuBank__OracleCompromised();
-        }
-        if (block.timestamp - updatedAt > ORACLE_HEARTBEAT) {
-            revert KipuBank__StalePrice();
-        }
-
-        return (_amount * uint256(price)) / (10**uint256(token.decimals));
-    }
 
 
     /// -----------------------------------------------------------------------------------------------
     ///                                    INTERNAL FUNCTIONS
     /// -----------------------------------------------------------------------------------------------
     
-    /// @notice Updates user balance upon deposit
-    /// @param _tokenAddress Token address
-    /// @param _user User address
-    /// @param _amount Amount to deposit
-    function _deposit(address _tokenAddress, address _user, uint256 _amount) internal nonZeroAmount(_amount) {
-        s_balances[_tokenAddress][_user] += _amount;
-        _updateCounters(true);
-
-        uint256 value = getValueInUsd(_tokenAddress, _amount);
-        s_totalUsdValue += value;
-
-        emit Deposited(_tokenAddress, _user, _amount);
-    }
-
     /**
      * @notice Función interna para manejar la lógica común post-depósito (directo o post-swap).
      * @param _user Dirección del usuario que deposita.
@@ -335,16 +296,6 @@ contract KipuBank is Ownable {
             s_totalDeposits += 1;
         } else {
             s_totalWithdrawals += 1;
-        }
-    }
-
-    /// @notice Safe ETH transfer
-    /// @param to Recipient's address
-    /// @param amount ETH amount to send
-    function _safeTransferEth(address to, uint256 amount) private {
-        (bool sent, ) = to.call{value: amount}("");
-        if (!sent) {
-            revert KipuBank__TransferFailed(to, amount);
         }
     }
 
